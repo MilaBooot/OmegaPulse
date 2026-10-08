@@ -1,50 +1,83 @@
-# Optional Falco runtime sensor
+# Falco runtime sensor
 
-Falco is the proposed rule-based sensor for Linux production hosts. The monitor
-does not install or control Falco. It only reads Falco's newline-delimited JSON
-file when `OMA_MONITOR_SECURITY_EVENTS_FILE` is configured.
+Falco observes the native Linux kernel and reports outbound connections,
+namespace/mount operations, shell/network tooling, and Docker-socket pathname
+access. Signals describe attempts, not confirmed compromise. Expected provider
+traffic needs profiling and reviewed allowlists before production alerting.
 
-The included rules flag four kinds of signals for the container named `omega`:
+## Configured target
 
-- any outbound IPv4/IPv6 connection attempt;
-- namespace or mount manipulation;
-- execution of shells and common network utilities;
-- attempts to open a Docker daemon socket.
+`oma_rules.yaml` is a template. Render it using the same `OMA_MONITOR_CONTAINER`
+as the monitor; the default is `omega`. Container names are validated before
+substitution, preventing rule/shell injection. Do not load the template directly.
 
-These are indicators, not proof that a breach or escape occurred. In particular,
-Oma normally makes outbound model/provider requests, so the outbound rule is
-intentionally noisy. Profile expected destinations and processes in staging,
-then add explicit allowlists before production alerting. Keep the upstream Falco
-default rules enabled as another layer.
+```bash
+export OMA_MONITOR_CONTAINER=my-oma
+python3 -m monitor.render_rules monitor/falco/oma_rules.yaml \
+  monitor/.local/falco-events/oma_rules.rendered.yaml
+```
 
-## Integration contract
+The Docker launcher renders automatically and mounts only the rendered rules:
 
-1. Install Falco separately on the Linux host using the official instructions.
-2. Load `oma_rules.yaml` after Falco's default rules.
-3. Merge `falco-output.fragment.yaml` into `falco.yaml` and run Falco unbuffered.
-4. Give the monitor read-only filesystem permission to the resulting JSON-lines
-   file. Do not expose Falco's control surface through the monitor.
-5. Set, for example:
+```bash
+bash monitor/scripts/falco.sh
+```
 
-   ```bash
-   export OMA_MONITOR_SECURITY_EVENTS_FILE=/var/log/falco/oma-events.jsonl
-   ```
+Existing containers retain their launch configuration; changing the environment
+requires creating a new sensor with a different `OMA_FALCO_CONTAINER`, after
+stopping the previous sensor. Do not run duplicate sensors unnecessarily.
 
-Falco's file output does not rotate itself. Configure host log rotation and
-retention, and keep permissions narrow because events can include commands,
-usernames, addresses, and other sensitive metadata.
+## Timestamped event rotation
 
-## Deployment warning
+The bundled writer receives Falco JSON through persistent `program_output`.
+It writes complete JSON lines without buffering to `oma-events.jsonl`, and
+renames completed files to `oma-events.<UTC-timestamp>.<unique-suffix>.jsonl`.
+Rotation happens before the next record would cross the size threshold, or when
+an interval has elapsed and the next record arrives. There is no idle empty-file
+rotation. The active filename stays stable for the monitor's read-only reader.
 
-Falco consumes Linux kernel events and requires elevated host capabilities and
-host mounts. Do not copy a privileged `docker run` command into production
-without infrastructure/security review. Docker Desktop/WSL is useful for the
-monitor integration test but is not a faithful production Falco environment.
-Validate the Falco version, driver, rules syntax, event volume, and dropped-event
-metrics on the actual Linux deployment target.
+| Variable | Default |
+| --- | --- |
+| `OMA_MONITOR_LOG_MAX_BYTES` | `20480` (20 KiB) |
+| `OMA_MONITOR_LOG_INTERVAL_SECONDS` | `3600` (one hour) |
+| `OMA_MONITOR_LOG_KEEP` | `10` archives, plus the active file |
 
-References:
+Example:
 
-- <https://falco.org/docs/setup/container/>
-- <https://falco.org/docs/reference/rules/examples/>
-- <https://falco.org/docs/concepts/outputs/channels/>
+```bash
+OMA_MONITOR_LOG_MAX_BYTES=20480 OMA_MONITOR_LOG_INTERVAL_SECONDS=3600 \
+  bash monitor/scripts/falco.sh
+```
+
+A single JSON record larger than the threshold is kept intact in its own file;
+records are never split. The maximum accepted record is 1 MiB. Retention deletes
+old archives; copy them elsewhere if durable evidence is required. Archives
+removed before a reader catches up cannot be replayed. Use one writer
+per directory. These event files contain raw command metadata and require private
+storage. The Docker launcher runs the writer as the operator's UID/GID, while the
+sensor keeps its previously reviewed kernel privileges.
+
+## Host installation
+
+1. Install Falco and Python 3 separately on the native Linux host.
+2. Render the target template and load the result after Falco's default rules.
+3. Install `monitor/event_writer.py` at `/writer/event_writer.py` (or adjust the
+   program path), create a private writable event directory, and merge
+   `falco-output.fragment.yaml` into the reviewed Falco configuration.
+4. Configure the writer environment with `OMA_MONITOR_WRITER_FILE` (default
+   `/events/oma-events.jsonl`) and the rotation variables above. Optionally set
+   both `OMA_MONITOR_WRITER_UID` and `OMA_MONITOR_WRITER_GID` to drop the writer's
+   privileges. Run Falco unbuffered, with native file output disabled so it does
+   not compete with the rotating writer.
+5. Give the monitor read-only directory access and set
+   `OMA_MONITOR_SECURITY_EVENTS_FILE` to the active JSON-lines path. Check writer
+   errors in Falco's service logs; file availability alone does not prove capture.
+
+## Access
+
+The Docker sensor image installs Python for the writer and preserves Falco's
+modern eBPF driver. The launcher uses privileged kernel access and reviewed host
+mounts. The monitor does not expose Falco's control surface. Validate capture,
+false-positive volume, and dropped-event metrics on the native deployment host.
+
+Reference: [Falco output channels](https://falco.org/docs/concepts/outputs/channels/).

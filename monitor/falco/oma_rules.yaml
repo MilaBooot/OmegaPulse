@@ -1,9 +1,7 @@
-# Prototype rules for the container named "omega". Profile and tune these on a
-# staging Linux host before production use. These are indicators, not proof of
-# compromise. If OMA_MONITOR_CONTAINER changes, update oma_target_container.
+# Render this template with python -m monitor.render_rules before loading it.
 
 - macro: oma_target_container
-  condition: container.name = omega
+  condition: container.name = __OMA_MONITOR_CONTAINER__
 
 - macro: oma_network_connection
   condition: syscall.type = connect and (fd.typechar = 4 or fd.typechar = 6)

@@ -124,11 +124,11 @@ class DockerBackend:
         result["action"] = action
         return result
 
-    def log_events(self) -> Generator[dict[str, str], None, None]:
+    def log_events(self, stop_event=None) -> Generator[dict[str, str], None, None]:
         """Follow logs forever, reconnecting after failures or container replacement."""
         last_container_id: str | None = None
         last_notice: str | None = None
-        while True:
+        while stop_event is None or not stop_event.is_set():
             client = None
             try:
                 client = self._client_factory()
@@ -163,7 +163,7 @@ class DockerBackend:
                     if notice != last_notice:
                         yield self._system_event(notice)
                         last_notice = notice
-                    self._sleep(self.reconnect_seconds)
+                    self._sleep(self.reconnect_seconds) if stop_event is None else stop_event.wait(self.reconnect_seconds)
                     continue
                 chunks = container.logs(
                     stdout=True,
@@ -173,9 +173,25 @@ class DockerBackend:
                     timestamps=True,
                     tail=tail,
                 )
-                for line in _bounded_lines(chunks):
-                    last_notice = None
-                    yield {"type": "log", "text": redact(line)}
+                finished = threading.Event()
+                if stop_event is not None:
+                    def cancel_when_stopped(watched=chunks, done=finished):
+                        while not done.wait(0.2):
+                            if stop_event.is_set():
+                                if hasattr(watched, "close"):
+                                    watched.close()
+                                return
+                    threading.Thread(target=cancel_when_stopped, daemon=True).start()
+                try:
+                    for line in _bounded_lines(chunks):
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        last_notice = None
+                        yield {"type": "log", "text": redact(line)}
+                finally:
+                    finished.set()
+                    if hasattr(chunks, "close"):
+                        chunks.close()
                 notice = "Log stream ended unexpectedly; reconnecting."
                 if notice != last_notice:
                     yield self._system_event(notice)
@@ -193,7 +209,7 @@ class DockerBackend:
                     last_notice = notice
             finally:
                 self._close_client(client)
-            self._sleep(self.reconnect_seconds)
+            self._sleep(self.reconnect_seconds) if stop_event is None else stop_event.wait(self.reconnect_seconds)
 
     @staticmethod
     def _system_event(message: str) -> dict[str, str]:

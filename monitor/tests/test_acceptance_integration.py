@@ -8,7 +8,6 @@ initial running/stopped state.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -17,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from monitor.app import create_app
+from monitor.auth import AuthStore
 from monitor.config import MonitorConfig
 from monitor.docker_backend import DockerBackend
 from monitor.security_backend import SecurityEventReader
@@ -24,15 +24,10 @@ from monitor.security_backend import SecurityEventReader
 
 TARGET = os.environ.get("OMA_MONITOR_ACCEPTANCE_CONTAINER")
 
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.integration, pytest.mark.skipif(
     not TARGET,
     reason="set OMA_MONITOR_ACCEPTANCE_CONTAINER to an existing disposable container",
-)
-
-
-def _basic(username: str, password: str) -> dict[str, str]:
-    encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-    return {"Authorization": f"Basic {encoded}"}
+)]
 
 
 def _falco_record(container: str, output: str) -> str:
@@ -81,20 +76,25 @@ def test_combined_monitor_acceptance(tmp_path: Path) -> None:
         assert backend.perform_action("start")["state"] == "running"
 
     config = MonitorConfig(
-        username=username,
-        password=password,
+        auth_db=tmp_path / "users.sqlite3",
+        cookie_secure=False,
         container_name=TARGET,
         reconnect_seconds=0.01,
         security_events_file=events_file,
     )
-    app = create_app(config, backend, SecurityEventReader(events_file, TARGET))
+    store = AuthStore(config.auth_db)
+    store.add_user(username, password, "operator")
+    app = create_app(config, backend, SecurityEventReader(events_file, TARGET), store)
     app.testing = True
     client = app.test_client()
-    auth = _basic(username, password)
+    auth = {}
 
     try:
         assert client.get("/api/status").status_code == 401
-        assert client.get("/api/status", headers=_basic(username, "wrong-password")).status_code == 401
+        login_page = client.get("/login").get_data(as_text=True)
+        login_csrf = re.search(r'name="csrf_token" value="([^\"]+)"', login_page).group(1)
+        assert client.post("/login", json={"username":username, "password":"wrong-password", "csrf_token":login_csrf}).status_code == 401
+        assert client.post("/login", json={"username":username, "password":password, "csrf_token":login_csrf}).status_code == 200
 
         page_response = client.get("/", headers=auth)
         assert page_response.status_code == 200

@@ -15,7 +15,7 @@ Three separate containers have different jobs:
 | Monitor (`oma-monitor-live`) | Provides browser authentication, Docker controls, logs, and the event display |
 
 The monitor reads Docker status/logs through the Docker socket. Falco writes
-JSON-lines events to a shared host directory; the monitor reads that directory
+JSON-lines events through a rotating writer to a shared host directory; the monitor reads that directory
 read-only and streams matching, redacted events to the browser. Falco runs
 separately because its eBPF sensor needs privileged kernel access, while the web
 application does not need to run as a privileged container. Each can be restarted
@@ -24,8 +24,9 @@ require a working Falco sensor.
 
 ### What Falco watches and what access it has
 
-The executable rules are in [falco/oma_rules.yaml](falco/oma_rules.yaml). Every
-rule selects the configured Oma container, initially `container.name = omega`:
+The rule template is [falco/oma_rules.yaml](falco/oma_rules.yaml). The launcher
+renders its target from `OMA_MONITOR_CONTAINER` (default `omega`), matching the
+monitor configuration:
 
 | Rule | Watched operation | Priority |
 | --- | --- | --- |
@@ -67,7 +68,7 @@ bash monitor/scripts/falco.sh
 bash monitor/scripts/live.sh start
 ```
 
-Choose the browser credentials when prompted, then open `http://127.0.0.1:8765/`.
+Create your individual operator account when prompted, then open `http://127.0.0.1:8765/`.
 Check container status, live logs, and the security panel. Start/Stop/Restart
 buttons act on Oma; the shell launcher's stop/resume commands act on the monitor.
 Generate three controlled security indicators with:
@@ -85,9 +86,9 @@ docker stop oma-falco-live
 ```
 
 Resume an existing stopped sensor with `docker start oma-falco-live`; the Falco
-launcher deliberately refuses to overwrite an existing container. If your target
-has another name, set `OMA_MONITOR_CONTAINER` and update the target macro in
-`falco/oma_rules.yaml` before launching the sensor.
+launcher deliberately refuses to overwrite an existing container. Set
+`OMA_MONITOR_CONTAINER` before launching both components for a differently named
+Oma container. The Falco launcher validates and renders this setting automatically.
 
 ## Start separately from Oma
 
@@ -101,12 +102,13 @@ bash monitor/scripts/live.sh start
 ```
 
 This builds the small monitor image using only `monitor/`, prompts for the browser
-username/password (at least 12 characters), and starts it at
+individual operator account/password (at least 12 characters), and starts it at
 `http://127.0.0.1:8765/`. It never starts, removes, renames, or recreates Oma.
 The monitor container runs as your user with the Docker socket's group.
 
-To change the browser login, rerun `start` or `monitor`. The old monitor is stopped
-and preserved under a timestamped backup name. Stop/resume affect only the monitor:
+Accounts persist in the private `monitor/.local/auth/` directory. Rebuilding the
+monitor preserves them. A replaced monitor is kept under a timestamped backup
+name. Stop/resume affect only the monitor:
 
 ```bash
 bash monitor/scripts/live.sh stop
@@ -115,8 +117,57 @@ bash monitor/scripts/live.sh resume
 
 The launcher assumes native Linux and a local `/var/run/docker.sock`. For a
 Python process instead, create a venv, install `monitor/requirements.txt`, set
-`OMA_MONITOR_USERNAME` and `OMA_MONITOR_PASSWORD`, then run `python -m monitor.app`
-from the repository root. See `.env.example` for configuration placeholders.
+`OMA_MONITOR_AUTH_DB`, run `python -m monitor.users add alice --role operator`,
+then run `python -m monitor.app` from the repository root. For local HTTP only,
+set `OMA_MONITOR_COOKIE_SECURE=false`; HTTPS uses the secure default. See
+`.env.example` for configuration placeholders.
+
+## Individual users, roles, and MFA
+
+The login page uses individual accounts with scrypt password hashes. There is no
+shared login, default password, or Basic Auth fallback. Roles are enforced on the
+server: `viewer` can read status/logs/events; `operator` can also Start/Stop/Restart.
+Account administration is a local CLI operation requiring access to the private
+identity database; a web operator cannot create users or promote their role.
+
+```bash
+bash monitor/scripts/live.sh users add alice --role operator
+bash monitor/scripts/live.sh users add bob --role viewer
+bash monitor/scripts/live.sh users role bob --role operator
+bash monitor/scripts/live.sh users password alice
+bash monitor/scripts/live.sh users disable bob
+bash monitor/scripts/live.sh users list
+```
+
+Passwords are entered through hidden prompts, never command arguments or Docker
+credential environment variables. `OMA_MONITOR_AUTH_DIR` selects the Docker
+identity directory; `OMA_MONITOR_AUTH_DB` selects the Python process database.
+Protect the database and backups: they contain password hashes and MFA secrets.
+
+Optional authenticator-app MFA is enabled per account:
+
+```bash
+bash monitor/scripts/live.sh users mfa alice
+```
+
+Add the private enrollment URI to a TOTP authenticator and confirm its current
+code. Subsequent login requires password plus code; reused codes are rejected.
+A host administrator can recover lost MFA with `users disable-mfa alice`, or
+restore a disabled account with `users enable alice`. These changes revoke its
+sessions. No self-service password reset or public registration is exposed.
+
+Session cookies are opaque, HttpOnly, SameSite=Strict, and Secure by default.
+The local launcher allows HTTP cookies only on loopback. Logout deletes the
+server-side session, and account/password/role/MFA changes revoke all that user's
+sessions. Sessions expire after 15 minutes without page navigation/control
+requests or after eight hours absolutely. Background polling and SSE do not
+extend idle lifetime. Event streams also check revocation while quiet.
+
+Login is limited to five failed attempts per username and 20 total attempts per
+source IP in a rolling 15-minute window; blocked requests return HTTP 429.
+Limits persist across restarts and cannot be bypassed by `X-Forwarded-For`.
+Behind a reverse proxy, the observed source is the proxy; configure trusted
+proxy handling at the deployment boundary if per-client limits are needed.
 
 ## Optional real Falco signals
 
@@ -170,8 +221,8 @@ Never mount the host Docker socket into Oma just to generate this indicator.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OMA_MONITOR_USERNAME` | required | Browser operator username |
-| `OMA_MONITOR_PASSWORD` | required | Browser password, at least 12 characters |
+| `OMA_MONITOR_AUTH_DB` | `monitor/.local/auth/users.sqlite3` | Private individual-account/session database |
+| `OMA_MONITOR_COOKIE_SECURE` | `true` | HTTPS-only cookies; false allowed only on loopback |
 | `OMA_MONITOR_CONTAINER` | `omega` | Fixed target container |
 | `OMA_MONITOR_HOST` | `127.0.0.1` | Python server bind address |
 | `OMA_MONITOR_PORT` | `8765` | Server port |
@@ -179,12 +230,12 @@ Never mount the host Docker socket into Oma just to generate this indicator.
 
 The Docker launcher fixes the server to localhost and maps its shared event file
 to `/events/oma-events.jsonl`. `OMA_MONITOR_DOCKER_NAME` selects its own container
-name; `OMA_FALCO_CONTAINER` selects the sensor container name. If Oma's name
-changes, also update `oma_target_container` in `falco/oma_rules.yaml`.
+name; `OMA_FALCO_CONTAINER` selects the sensor container name. The sensor renders
+the same `OMA_MONITOR_CONTAINER` into its rules. Set it before launching both.
 
 ## Authorization
 
-All page/API routes require independent HTTP Basic authentication. Lifecycle
+The dashboard and monitoring APIs require an authenticated server-side session. Lifecycle
 requests also require POST JSON, a CSRF header, browser confirmation, and serialized
 Docker operations. Start only starts an existing container; it never recreates one.
 Logs/events are rendered as text, redacted on a best-effort basis, and bounded to
@@ -194,18 +245,17 @@ container/event-file replacement.
 
 Docker socket access gives the monitor privileged host control. Restrict its
 operator account and keep it on localhost, through SSH, or behind HTTPS.
-Credentials are stored in container environment configuration by Docker,
-not in the repository or browser storage. Do not use `bash -x` when entering secrets.
+Passwords are stored as hashes in the private identity database, not in the
+repository or browser storage. Do not use `bash -x` when entering secrets.
 
 ## Major limitations and improvements
 
 - **Detection tuning:** Falco signals describe attempts, not confirmed breaches.
   Outbound rules include normal traffic; production use needs reviewed allowlists
   and false-positive tuning. Automatic containment is not implemented.
-- **Operator access:** One operator account is supported. Production identity
-  controls and multiple operator roles remain future work.
-- **Retention:** Browser history is bounded; durable audit/event storage and
-  host-side Falco file rotation must be configured separately.
+- **Retention:** Falco files rotate by size/time with timestamped archives and
+  bounded retention; archives removed before the reader catches up cannot be replayed.
+  Central audit storage and off-host archival remain separate.
 - **Health visibility:** Docker “running” does not establish agent health, and a
   readable event file does not establish sensor health. Explicit health checks
   remain future work.
@@ -225,17 +275,20 @@ Real Docker lifecycle tests are opt-in and must target a disposable container.
 See [TESTING.md](TESTING.md) for mock services, combined acceptance, and native
 Falco capture checks; [HANDOFF.md](HANDOFF.md) records executed results and limits.
 
-## Contribution scope
+## CI and required checks
 
-The feature can be shared as just this `monitor/` directory, including its image
-definition, launchers, rules, tests, and documentation. It does not require changes
-to Oma's source or dependencies. Current collaboration work is on
-`MilaBooot/mettaclaw`, branch `feat/oma-monitor-phase1`; the intended destination
-is `iCog-Labs-Dev/OmegaPulse`.
+`.github/workflows/monitor-tests.yml` runs the unit suite and shell syntax checks
+on every pull request, without path filters or continue-on-error. Real Docker
+integration tests are explicitly excluded from this unprivileged unit job.
+The repository maintainer must enable branch protection/rulesets on `main` and
+require the `monitor-unit-tests` status check. A workflow file alone cannot
+prevent merges or configure that repository-level setting.
 
-A cross-repository pull request requires a suitable target base branch and shared
-Git history/fork relationship. If OmegaPulse is empty or has unrelated history,
-its maintainer must first establish a base branch and contribution workflow.
-Then use a fork of OmegaPulse and copy only `monitor/` onto a branch based on that
-repository. Do not propose the whole Oma repository history merely to transfer
-the monitor folder. Confirm that workflow before publishing a PR.
+## Migration from Basic Auth
+
+Old `OMA_MONITOR_USERNAME` / `OMA_MONITOR_PASSWORD` values are no longer used.
+Run the updated launcher to create individual accounts; old browser-cached
+credentials do not grant access. Preserve the existing event directory using
+`OMA_MONITOR_EVENTS_DIR` if needed. Existing old sensor containers still use
+unrotated native file output; adopting the writer requires a newly built sensor.
+Review kernel privileges before switching, and avoid running duplicate sensors.

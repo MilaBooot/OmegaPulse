@@ -81,16 +81,17 @@ docker network rm oma-monitor-acceptance-net
 
 ## Real native-Linux Falco test
 
-Oma and Falco must share the native Linux kernel. The included rule macro selects
-`omega`; for a differently named disposable target, edit a separate test rule
-copy to match its name. Rules and event-file configuration must agree with the
-monitor's configured target. Do not run multiple test sensors unnecessarily.
+Oma and Falco must share the native Linux kernel. Render the rules using
+`OMA_MONITOR_CONTAINER` for the disposable target; rules and event-file
+configuration must agree with the monitor's configured target. Do not run multiple test sensors unnecessarily.
 
-First validate the actual rules without kernel privileges:
+First render and validate the actual rules without kernel privileges:
 
 ```bash
+python3 -m monitor.render_rules monitor/falco/oma_rules.yaml \
+  monitor/.local/falco-events/oma_rules.rendered.yaml
 docker run --rm \
-  --mount "type=bind,src=$PWD/monitor/falco/oma_rules.yaml,dst=/rules/oma_rules.yaml,readonly" \
+  --mount "type=bind,src=$PWD/monitor/.local/falco-events/oma_rules.rendered.yaml,dst=/rules/oma_rules.yaml,readonly" \
   falcosecurity/falco:0.45.0 falco -V /rules/oma_rules.yaml
 ```
 
@@ -136,3 +137,18 @@ Normal provider/Telegram connections trigger outbound Notices too. High counts
 are expected with the current alert-all prototype. Profile and review allowlists;
 do not automate containment based on these rules. Keep production sensor tuning,
 dropped-event metrics, and log retention separate from this short integration test.
+
+## PR review regression coverage
+
+Unit tests cover individual login, password hashing, viewer/operator permissions,
+login/action/logout CSRF, cookie flags, session fixation prevention, server-side
+revocation, idle/absolute expiration, quiet-stream shutdown, persistent username
+lockout and IP limits, optional TOTP/replay rejection, size/time rotation,
+timestamped archive retention, reader follow after rotation, and target injection
+rejection. CI runs `python -m pytest monitor/tests -q -m 'not integration'` on every
+PR. Require its `monitor-unit-tests` status in repository branch protection.
+
+Authentication changed: tests now create temporary individual-account databases
+and log in using the CSRF-protected login route rather than Basic Auth headers.
+Historical validation records describe the old implementation and are not evidence
+for the new login flow. New executed results are recorded separately in HANDOFF.md.

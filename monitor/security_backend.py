@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import chain
 import time
 from collections.abc import Callable, Generator
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ class SecurityEventReader:
             return {"state": "waiting-for-events-file", "configured": True}
         return {"state": "available", "configured": True}
 
-    def events(self) -> Generator[dict[str, str], None, None]:
+    def events(self, stop_event=None) -> Generator[dict[str, str], None, None]:
         if self.path is None:
             yield self._system("Runtime detection is not configured.")
             return
@@ -54,14 +55,19 @@ class SecurityEventReader:
         identity: tuple[int, int] | None = None
         waiting_notified = False
         inaccessible_notified = False
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
                 stat = self.path.stat()
                 current_identity = (stat.st_dev, stat.st_ino)
                 rotated = identity is not None and current_identity != identity
                 truncated = current_identity == identity and stat.st_size < position
                 if identity is None or rotated or truncated:
-                    lines, position = self._tail_lines(self.path, count=100)
+                    if rotated:
+                        progress = {"position": 0}
+                        lines = chain(self._rotated_records(identity, position),
+                                      self._complete_records(self.path, progress=progress))
+                    else:
+                        lines, position = self._tail_lines(self.path, count=100)
                     identity = current_identity
                     if rotated or truncated:
                         yield self._system("Security event file rotated; following the replacement.")
@@ -78,25 +84,29 @@ class SecurityEventReader:
                     lines = []
                 waiting_notified = inaccessible_notified = False
                 for raw_line in lines:
+                    if stop_event is not None and stop_event.is_set():
+                        return
                     event = self._parse_event(raw_line)
                     if event is not None:
                         yield event
+                if rotated:
+                    position = progress["position"]
             except FileNotFoundError:
                 if not waiting_notified:
                     yield self._system("Waiting for the configured Falco events file.")
                     waiting_notified = True
                 identity = None
                 position = 0
-                self._sleep(self.poll_seconds)
+                self._sleep(self.poll_seconds) if stop_event is None else stop_event.wait(self.poll_seconds)
                 continue
             except OSError:
                 if not inaccessible_notified:
                     yield self._system("Configured security event file is unreadable.")
                     inaccessible_notified = True
-                self._sleep(self.poll_seconds)
+                self._sleep(self.poll_seconds) if stop_event is None else stop_event.wait(self.poll_seconds)
                 continue
 
-            self._sleep(self.poll_seconds)
+            self._sleep(self.poll_seconds) if stop_event is None else stop_event.wait(self.poll_seconds)
 
     def _parse_event(self, raw_line: bytes) -> dict[str, str] | None:
         try:
@@ -116,6 +126,29 @@ class SecurityEventReader:
             }
         except (AttributeError, json.JSONDecodeError):
             return None
+
+    def _rotated_records(self, identity, position):
+        found = False
+        for archive in sorted(self.path.parent.glob(f"{self.path.stem}.*.jsonl")):
+            stat = archive.stat()
+            matches = (stat.st_dev, stat.st_ino) == identity
+            if matches:
+                found = True
+            if found:
+                yield from self._complete_records(archive, position if matches else 0)
+
+    @staticmethod
+    def _complete_records(path, position=0, progress=None):
+        with path.open("rb") as stream:
+            stream.seek(position)
+            while record := stream.readline(1_048_577):
+                if len(record) > 1_048_576:
+                    raise OSError("Security event record exceeds the supported limit")
+                if record.endswith(b"\n"):
+                    position += len(record)
+                    if progress is not None:
+                        progress["position"] = position
+                    yield record
 
     @staticmethod
     def _tail_lines(path: Path, count: int, byte_limit: int = 1_048_576) -> tuple[list[bytes], int]:

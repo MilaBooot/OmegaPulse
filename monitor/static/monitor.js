@@ -53,6 +53,7 @@ function parseEvent(event, system) {
 
 function connectLogs() {
   const source = new EventSource("/api/logs");
+  source.addEventListener("auth-expired", () => { source.close(); window.location.assign("/login"); });
   source.onopen = () => {
     connectionState.textContent = "Live";
     connectionState.className = "connected";
@@ -84,6 +85,7 @@ function renderSecurityEvents() {
 function connectSecurityEvents() {
   if (securitySource) return;
   securitySource = new EventSource("/api/security/events");
+  securitySource.addEventListener("auth-expired", () => { securitySource.close(); window.location.assign("/login"); });
   securitySource.addEventListener("security", (event) => {
     try {
       securityRecords.push(JSON.parse(event.data));
@@ -104,6 +106,7 @@ function connectSecurityEvents() {
 async function refreshSecurityStatus() {
   try {
     const response = await fetch("/api/security/status", {cache: "no-store"});
+    if (response.status === 401) { window.location.assign("/login"); return; }
     const data = await response.json();
     const labels = {
       available: "Detector event file available",
@@ -122,6 +125,7 @@ async function refreshStatus() {
   try {
     const response = await fetch("/api/status", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (response.status === 401) { window.location.assign("/login"); return; }
     const data = await response.json();
     statusBox.className = `status ${data.state}`;
     const labels = {
@@ -149,6 +153,7 @@ async function performAction(action) {
       headers: {"Content-Type": "application/json", "X-CSRF-Token": csrfToken},
       body: "{}",
     });
+    if (response.status === 401) { window.location.assign("/login"); return; }
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     actionState.textContent = `${labels[action]} completed`;
@@ -181,3 +186,8 @@ refreshStatus();
 refreshSecurityStatus();
 window.setInterval(refreshStatus, 5000);
 window.setInterval(refreshSecurityStatus, 5000);
+
+document.getElementById("logout").addEventListener("click", async () => {
+  const response = await fetch("/logout", {method: "POST", headers: {"X-CSRF-Token": csrfToken}});
+  if (response.ok || response.status === 401) window.location.assign("/login");
+});

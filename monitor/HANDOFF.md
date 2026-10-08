@@ -1,6 +1,6 @@
 # Oma monitoring handoff
 
-Last updated: 2026-10-07
+Last updated: 2026-10-08
 
 ## Purpose and scope
 
@@ -11,16 +11,19 @@ JSON-event display with prototype rules. It makes no changes to Oma reasoning,
 Telegram behavior, or deployment workflows. No AI/ML is used.
 
 Still deferred: automatic containment, Docker Pause, host/network isolation,
-production Falco deployment/tuning, centralized retention/dashboards, multiple
-operator roles, and production deployment.
+production Falco deployment/tuning, centralized retention/dashboards, and
+production deployment. Individual accounts, roles, sessions, optional MFA, and
+bounded local event rotation were added in the PR review follow-up below.
 
 ## Repository and base
 
 - Original source upstream: `https://github.com/iCog-Labs-Dev/Omega.git`
 - Intended monitor PR destination (operator confirmed):
   `https://github.com/iCog-Labs-Dev/OmegaPulse`
-- Collaboration fork: `https://github.com/MilaBooot/mettaclaw.git`
-- Branch: `feat/oma-monitor-phase1`
+- Current PR fork: `https://github.com/MilaBooot/OmegaPulse.git`
+- Current PR branch: `feat/oma-monitor`; organization base: `main`
+- Original prototype fork: `https://github.com/MilaBooot/mettaclaw.git`
+- Original prototype branch: `feat/oma-monitor-phase1`
 - Original source base branch: upstream `telegram`; the OmegaPulse PR base is
   not yet confirmed and must not be assumed to be `telegram`.
 - Base commit: `2aaa207d117254845372b0bf6e0ed36f297c5217`
@@ -29,7 +32,9 @@ operator roles, and production deployment.
   commits behind at the time of review. The feature must not be rebased onto
   that stale ref.
 
-No push, PR, deployment, production connection, or release was performed.
+The historical sections below record pre-publication work. OmegaPulse PR #1 now
+exists; these review fixes are prepared locally and have not been pushed.
+No production deployment or release was performed.
 
 ## Review findings verified
 
@@ -45,7 +50,7 @@ No push, PR, deployment, production connection, or release was performed.
   `singnet/Omega_CustomBots`; this branch was not treated as the deployed-system
   source of truth and the workflows were not changed.
 
-## Implementation decisions
+## Original prototype implementation decisions
 
 - Flask + Waitress and Docker SDK dependencies live only under `monitor/`.
 - HTTP Basic auth avoids secrets in URLs, application-managed browser storage,
@@ -378,6 +383,53 @@ Executed on Windows with Python 3.11.9:
 - Updated README/TESTING to replace the current unverified-rule claim with this
   scoped result. Historical skip records remain intact. No follow-up commit,
   push, PR, or deployment was performed for this test.
+
+### OmegaPulse PR #1 review fixes — 2026-10-08
+
+- Worked against the actual PR head `MilaBooot/OmegaPulse:feat/oma-monitor`,
+  commit `5f02a2e6701f1a56f8779b1fee07b5e336334443`, with organization base `main`.
+  The original Omega checkout and its uncommitted root ignore change were preserved.
+- Replaced shared Basic Auth with individual scrypt-hashed accounts, viewer/operator
+  roles enforced on the server, a CSRF-protected login page, opaque server-side
+  sessions, logout, and revocation after password/role/MFA/account changes. Cookies
+  are HttpOnly, SameSite Strict, Secure by default; local HTTP is allowed only on
+  loopback. Sessions have 15-minute idle and eight-hour absolute expiry; quiet
+  streams check revocation and cancel their readers. Background polling does not
+  extend idle lifetime. Host-side CLI provides account administration/recovery.
+- Added persistent five-failure username lockout and 20-attempt source-IP throttling
+  over 15 minutes, plus optional per-user TOTP enrollment with replay rejection.
+  Reverse-proxy source-IP handling must be configured at a trusted boundary.
+- Removed the requested comments from `falco-output.fragment.yaml`. Added a
+  persistent program-output writer with size/time rotation and UTC timestamped
+  archives; defaults are 20 KiB, one hour, and ten archives plus the active file.
+  Single oversized records remain intact up to 1 MiB. The writer drops to the
+  operator UID/GID in the Docker sensor. Reader replay drains retained archives
+  in bounded memory after rotations; deleted archives cannot be recovered.
+- The Falco rules are now a template rendered from validated
+  `OMA_MONITOR_CONTAINER`, using the same target configuration as the monitor.
+  Launchers and host integration docs no longer require manual target edits.
+- Added `.github/workflows/monitor-tests.yml`: every PR runs unit tests and shell
+  syntax checks as `monitor-unit-tests`, without path filters/continue-on-error.
+  **The organization maintainer must require this check in main's branch protection
+  or ruleset.** No repository administration setting was changed by the agent.
+- Validation: **70 unit tests passed** on Python 3.12 and 3.14 (three integration
+  tests explicitly deselected); **three real Docker acceptance tests passed** on a
+  disposable target (`41.41s`). Real HTTP verified individual login, viewer 403,
+  operator 200, and logged-out cookie replay 401. Both image builds passed; rendered
+  custom-target rules passed Falco semantic validation. Shell syntax/whitespace passed.
+- Packaged writer retained 200 synthetic records across three timestamped archives,
+  with maximum file size 20,345 bytes under a 20,480-byte threshold.
+- Native modern-eBPF test of the new program-output pipeline captured all four rule
+  types for a disposable custom-name target: 150 outbound, nine namespace/mount,
+  one shell, and two fake-socket alerts, all matching syscall source and target ID.
+  Eight rotated archives were private, operator-owned, and below 20 KiB. The target
+  had no host mounts/real socket, no privileges/network/capabilities, only /run tmpfs.
+  The isolated test sensor used previously approved kernel mounts/privileges; both
+  test containers were removed and live Oma/Falco/monitor were not changed.
+- Evidence: `validation/pr-review-2026-10-08.json` and
+  `validation/pr-review-kernel-2026-10-08.json`. Earlier Basic Auth results remain
+  historical and do not assert the new login flow. Manual browser visual interaction
+  is not asserted. No push, deployment, or PR reply was performed for these fixes.
 
 ## Next milestone
 

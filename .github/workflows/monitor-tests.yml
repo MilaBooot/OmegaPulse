@@ -1,0 +1,21 @@
+name: Monitor tests
+on:
+  pull_request:
+  push:
+    branches: [main, feat/oma-monitor]
+permissions:
+  contents: read
+jobs:
+  unit-tests:
+    name: monitor-unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: monitor/requirements*.txt
+      - run: python -m pip install -r monitor/requirements-dev.txt
+      - run: python -m pytest monitor/tests -q -m 'not integration'
+      - run: bash -n monitor/scripts/live.sh monitor/scripts/falco.sh

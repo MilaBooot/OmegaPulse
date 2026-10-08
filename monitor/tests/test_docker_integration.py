@@ -2,6 +2,9 @@
 
 import os
 import unittest
+import pytest
+
+pytestmark = pytest.mark.integration
 
 from monitor.docker_backend import DockerBackend
 

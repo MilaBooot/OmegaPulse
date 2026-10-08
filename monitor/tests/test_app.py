@@ -1,8 +1,12 @@
 from pathlib import Path
-import base64
 import re
+import time
+
+import pyotp
+import pytest
 
 from monitor.app import create_app
+from monitor.auth import AuthStore, COOKIE
 from monitor.config import MonitorConfig
 
 
@@ -13,145 +17,229 @@ class FakeBackend:
 
     def status(self):
         self.status_calls += 1
-        return {
-            "state": "running",
-            "container": "omega",
-            "container_id": "abc123",
-            "docker_status": "running",
-            "agent_healthy": None,
-            "checked_at": "2026-01-01T00:00:00Z",
-        }
+        return {'state': 'running', 'container': 'omega', 'agent_healthy': None}
 
-    def log_events(self):
-        yield {"type": "log", "text": "<img src=x onerror=alert(1)>"}
+    def log_events(self, stop_event=None):
+        yield {'type': 'log', 'text': '<img src=x onerror=alert(1)>'}
 
     def perform_action(self, action):
         self.actions.append(action)
-        result = self.status()
-        result["action"] = action
-        return result
+        return {**self.status(), 'action': action}
 
 
-def make_client():
-    config = MonitorConfig(username="operator", password="long-test-password")
+@pytest.fixture
+def setup(tmp_path):
+    now = [1700000000.0]
+    store = AuthStore(tmp_path / 'auth.sqlite3', clock=lambda: now[0])
+    store.add_user('alice', 'a-long-test-password', 'operator')
+    store.add_user('bob', 'another-long-password', 'viewer')
     backend = FakeBackend()
-    app = create_app(config, backend)
+    app = create_app(MonitorConfig(auth_db=store.path, cookie_secure=False), backend, auth_store=store)
     app.testing = True
-    return app.test_client(), backend
+    return app, app.test_client(), backend, store, now
 
 
-def auth():
-    return {"Authorization": "Basic b3BlcmF0b3I6bG9uZy10ZXN0LXBhc3N3b3Jk"}
+def login(client, username='alice', password='a-long-test-password', otp='', headers=None):
+    page = client.get('/login').get_data(as_text=True)
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+    return client.post('/login', json={'username': username, 'password': password, 'otp': otp, 'csrf_token': csrf}, headers=headers)
 
 
-def test_page_status_stream_controls_and_security_require_authentication():
-    client, _ = make_client()
-    for path in (
-        "/",
-        "/api/status",
-        "/api/logs",
-        "/api/security/status",
-        "/api/security/events",
-    ):
-        response = client.get(path)
+def token(client):
+    page = client.get('/').get_data(as_text=True)
+    return re.search(r'name="csrf-token" content="([^"]+)"', page).group(1)
+
+
+def test_routes_require_session_and_basic_auth_is_no_longer_accepted(setup):
+    _, client, backend, _, _ = setup
+    for path in ('/api/status', '/api/logs', '/api/security/status', '/api/security/events'):
+        response = client.get(path, headers={'Authorization': 'Basic YWxpY2U6YS1sb25nLXRlc3QtcGFzc3dvcmQ='})
         assert response.status_code == 401
-        assert response.headers["WWW-Authenticate"].startswith("Basic ")
-        assert response.headers["Cache-Control"] == "no-store"
-    assert client.post("/api/actions/stop", json={}).status_code == 401
-
-
-def test_invalid_credentials_are_denied():
-    client, _ = make_client()
-    response = client.get(
-        "/api/status", headers={"Authorization": "Basic b3BlcmF0b3I6d3Jvbmc="}
-    )
-    assert response.status_code == 401
-
-
-def test_non_ascii_invalid_credentials_return_401_instead_of_500():
-    client, _ = make_client()
-    encoded = base64.b64encode("operator:wrong-🔑".encode()).decode()
-    assert client.get("/api/status", headers={"Authorization": f"Basic {encoded}"}).status_code == 401
-
-
-def test_unicode_configured_credentials_can_authenticate():
-    app = create_app(MonitorConfig(username="opérateur", password="a-long-password-🔑"), FakeBackend())
-    app.testing = True
-    encoded = base64.b64encode("opérateur:a-long-password-🔑".encode()).decode()
-    assert app.test_client().get("/api/status", headers={"Authorization": f"Basic {encoded}"}).status_code == 200
-
-
-def test_non_ascii_csrf_token_is_rejected_without_an_action():
-    client, backend = make_client()
-    response = client.post("/api/actions/stop", headers={**auth(), "X-CSRF-Token": "é"}, json={})
-    assert response.status_code == 403
+        assert 'WWW-Authenticate' not in response.headers
+        assert response.headers['Cache-Control'] == 'no-store'
+    assert client.get('/').status_code == 303
+    assert client.post('/api/actions/stop', json={}).status_code == 401
     assert backend.actions == []
 
 
-def test_authenticated_status_uses_only_configured_backend():
-    client, backend = make_client()
-    response = client.get("/api/status", headers=auth())
+def test_login_requires_csrf_and_rejects_invalid_credentials(setup):
+    _, client, _, _, _ = setup
+    assert client.post('/login', json={'username': 'alice', 'password': 'a-long-test-password'}).status_code == 403
+    assert login(client, password='wrong-🔑').status_code == 401
+    assert client.get('/api/status').status_code == 401
+
+
+def test_sessions_rotate_after_login_and_have_cookie_security(setup):
+    _, client, _, store, _ = setup
+    client.get('/login')
+    old = client.get_cookie(COOKIE).value
+    response = login(client)
     assert response.status_code == 200
-    assert response.json["container"] == "omega"
-    assert response.json["agent_healthy"] is None
-    assert backend.status_calls == 1
+    assert client.get_cookie(COOKIE).value != old
+    assert store.session(old) is None
+    cookie = response.headers['Set-Cookie']
+    assert 'HttpOnly' in cookie and 'SameSite=Strict' in cookie
+    assert 'a-long-test-password' not in store.path.read_bytes().decode(errors='ignore')
+    assert client.get('/api/status').json['container'] == 'omega'
 
 
-def test_query_parameters_cannot_select_a_container():
-    client, backend = make_client()
-    response = client.get("/api/status?container=other", headers=auth())
-    assert response.status_code == 400
-    assert backend.status_calls == 0
-    response = client.get("/api/logs?container=other", headers=auth())
-    assert response.status_code == 400
+def test_secure_cookie_default(tmp_path):
+    store = AuthStore(tmp_path / 'auth.db')
+    store.add_user('alice', 'a-long-test-password', 'viewer')
+    app = create_app(MonitorConfig(auth_db=store.path), FakeBackend(), auth_store=store)
+    assert 'Secure' in app.test_client().get('/login').headers['Set-Cookie']
 
 
-def test_lifecycle_action_requires_csrf_and_json():
-    client, backend = make_client()
-    assert client.post("/api/actions/stop", headers=auth()).status_code == 415
-    assert client.post("/api/actions/stop", headers=auth(), json={}).status_code == 403
+def test_viewer_cannot_control_container_even_with_valid_csrf(setup):
+    _, client, backend, _, _ = setup
+    assert login(client, 'bob', 'another-long-password').status_code == 200
+    csrf = token(client)
+    for action in ('start', 'stop', 'restart'):
+        assert client.post('/api/actions/'+action, json={}, headers={'X-CSRF-Token': csrf}).status_code == 403
     assert backend.actions == []
+    assert 'id="stop-container"' not in client.get('/').get_data(as_text=True)
+    assert client.get('/api/security/status').status_code == 200
 
 
-def test_lifecycle_action_uses_fixed_backend_target():
-    client, backend = make_client()
-    page = client.get("/", headers=auth()).get_data(as_text=True)
-    token = re.search(r'name="csrf-token" content="([^"]+)"', page).group(1)
-    headers = {**auth(), "X-CSRF-Token": token}
-    response = client.post("/api/actions/restart", headers=headers, json={})
-    assert response.status_code == 200
-    assert response.json["action"] == "restart"
-    assert backend.actions == ["restart"]
-    assert client.post(
-        "/api/actions/start?container=other", headers=headers, json={}
-    ).status_code == 400
-    assert backend.actions == ["restart"]
+def test_operator_action_requires_csrf_json_and_fixed_target(setup):
+    _, client, backend, _, _ = setup
+    login(client)
+    assert client.post('/api/actions/stop').status_code == 415
+    assert client.post('/api/actions/stop', json={}).status_code == 403
+    assert client.post('/api/actions/stop', json={}, headers={'X-CSRF-Token': 'é'}).status_code == 403
+    headers = {'X-CSRF-Token': token(client)}
+    assert client.post('/api/actions/restart', json={}, headers=headers).status_code == 200
+    assert backend.actions == ['restart']
+    assert client.post('/api/actions/start?container=other', json={}, headers=headers).status_code == 400
+    assert client.get('/api/status?container=other').status_code == 400
+    assert client.get('/api/logs?container=other').status_code == 400
+    assert client.post('/api/actions/stop', json={}, headers={**headers,'Sec-Fetch-Site':'cross-site'}).status_code == 403
+    assert backend.actions == ['restart']
 
 
-def test_cross_site_lifecycle_action_is_denied():
-    client, backend = make_client()
-    page = client.get("/", headers=auth()).get_data(as_text=True)
-    token = re.search(r'name="csrf-token" content="([^"]+)"', page).group(1)
-    response = client.post(
-        "/api/actions/stop",
-        headers={**auth(), "X-CSRF-Token": token, "Sec-Fetch-Site": "cross-site"},
-        json={},
-    )
-    assert response.status_code == 403
-    assert backend.actions == []
+def test_logout_revokes_server_session_and_requires_csrf(setup):
+    app, client, _, _, _ = setup
+    login(client)
+    cookie = client.get_cookie(COOKIE).value
+    assert client.post('/logout').status_code == 403
+    assert client.post('/logout', headers={'X-CSRF-Token':token(client)}).status_code == 200
+    attacker = app.test_client()
+    attacker.set_cookie(COOKIE, cookie)
+    assert attacker.get('/api/status').status_code == 401
 
 
-def test_log_stream_serializes_untrusted_text_as_data():
-    client, _ = make_client()
-    response = client.get("/api/logs", headers=auth())
-    body = response.get_data(as_text=True)
-    assert response.content_type == "text/event-stream; charset=utf-8"
-    assert '"text": "<img src=x onerror=alert(1)>"' in body
+@pytest.mark.parametrize('change',[{'enabled':0},{'role':'viewer'},{'password_hash':'unused'}])
+def test_account_changes_revoke_sessions(setup, change):
+    _, client, _, store, _ = setup
+    login(client)
+    store.update_user('alice', **change)
+    assert client.get('/api/status').status_code == 401
 
 
-def test_browser_renders_logs_with_text_content_only():
-    script = (Path(__file__).parents[1] / "static" / "monitor.js").read_text(
-        encoding="utf-8"
-    )
-    assert "logView.textContent" in script
-    assert "innerHTML" not in script
+@pytest.mark.parametrize('seconds',[901,28801])
+def test_session_expiration(setup, seconds):
+    _, client, _, _, now = setup
+    login(client)
+    now[0] += seconds
+    assert client.get('/api/status').status_code == 401
+
+
+def test_background_status_poll_does_not_extend_idle_session(setup):
+    _, client, _, _, now = setup
+    login(client)
+    now[0] += 800
+    assert client.get('/api/status').status_code == 200
+    now[0] += 101
+    assert client.get('/api/status').status_code == 401
+
+
+def test_per_account_lockout_persists_across_clients_and_recovers(setup):
+    app, client, _, _, now = setup
+    for _ in range(5):
+        assert login(client, password='wrong').status_code == 401
+    restarted_store = AuthStore(setup[3].path, clock=lambda:now[0])
+    restarted = create_app(MonitorConfig(auth_db=restarted_store.path,cookie_secure=False),
+                           FakeBackend(),auth_store=restarted_store)
+    other = restarted.test_client()
+    assert login(other).status_code == 429
+    now[0] += 901
+    assert login(other).status_code == 200
+
+
+def test_ip_limit_applies_across_usernames_and_ignores_forwarded_header(setup):
+    _, client, _, _, _ = setup
+    for number in range(20):
+        assert login(client, username=f'unknown{number}', headers={'X-Forwarded-For':f'10.0.0.{number}'}).status_code == 401
+    assert login(client).status_code == 429
+
+
+def test_optional_mfa_requires_code_and_rejects_replay(setup):
+    app, client, _, store, now = setup
+    secret = pyotp.random_base32()
+    store.update_user('alice', totp_secret=secret)
+    assert login(client).status_code == 401
+    assert login(client, otp='🔑').status_code == 401
+    code = pyotp.TOTP(secret).at(now[0])
+    assert login(client, otp=code).status_code == 200
+    other = app.test_client()
+    assert login(other, otp=code).status_code == 401
+    now[0] += 30
+    assert login(other, otp=pyotp.TOTP(secret).at(now[0])).status_code == 200
+
+
+def test_session_csrf_is_not_shared_between_users(setup):
+    app, client, _, _, _ = setup
+    login(client)
+    other = app.test_client()
+    login(other, 'bob', 'another-long-password')
+    assert token(client) != token(other)
+
+
+def test_unicode_password_authenticates(setup):
+    _, client, _, store, _ = setup
+    store.add_user('opérateur', 'a-long-password-🔑', 'viewer')
+    assert login(client, 'opérateur', 'a-long-password-🔑').status_code == 200
+
+
+def test_log_stream_and_rendering_treat_text_as_data(setup):
+    _, client, _, _, _ = setup
+    login(client)
+    response = client.get('/api/logs')
+    assert response.content_type == 'text/event-stream; charset=utf-8'
+    assert '"text": "<img src=x onerror=alert(1)>"' in response.get_data(as_text=True)
+    script = (Path(__file__).parents[1] / 'static/monitor.js').read_text()
+    assert 'logView.textContent' in script and 'innerHTML' not in script
+
+
+def test_open_stream_stops_delivering_after_session_revocation(setup):
+    _, client, _, store, _ = setup
+    login(client)
+    response = client.get('/api/logs', buffered=False)
+    assert next(response.response) == b'retry: 3000\n\n'
+    store.revoke(client.get_cookie(COOKIE).value)
+    assert b'auth-expired' in next(response.response)
+    with pytest.raises(StopIteration):
+        next(response.response)
+    response.close()
+
+
+def test_startup_without_accounts_fails_closed(tmp_path):
+    with pytest.raises(ValueError, match='No accounts'):
+        create_app(MonitorConfig(auth_db=tmp_path/'empty.db'), FakeBackend())
+
+
+def test_quiet_stream_closes_after_logout(setup):
+    app, client, backend, store, _ = setup
+    def quiet(stop_event=None):
+        stop_event.wait(5)
+        if False:
+            yield None
+    backend.log_events = quiet
+    login(client)
+    response = client.get('/api/logs', buffered=False)
+    next(response.response)
+    # Start collection and verify heartbeat while no Docker records exist.
+    assert b'keepalive' in next(response.response)
+    store.revoke(client.get_cookie(COOKIE).value)
+    assert b'auth-expired' in next(response.response)
+    response.close()

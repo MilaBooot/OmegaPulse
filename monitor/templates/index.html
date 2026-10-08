@@ -14,6 +14,7 @@
           <p class="eyebrow">Container monitor</p>
           <h1>{{ container_name }}</h1>
         </div>
+        <div><span>{{ username }}</span> <button id="logout" type="button">Log out</button></div>
         <div id="status" class="status unknown" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="status-text">Checking Docker…</span>
@@ -24,6 +25,7 @@
         “Running” is Docker process state only. It does not mean the Oma agent is healthy.
       </section>
 
+      {% if can_control %}
       <section class="controls" aria-labelledby="controls-heading">
         <div>
           <h2 id="controls-heading">Container controls</h2>
@@ -36,6 +38,7 @@
         </div>
       </section>
 
+      {% endif %}
       <section class="log-panel" aria-labelledby="logs-heading">
         <div class="toolbar">
           <div>
