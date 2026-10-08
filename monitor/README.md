@@ -150,11 +150,44 @@ Optional authenticator-app MFA is enabled per account:
 bash monitor/scripts/live.sh users mfa alice
 ```
 
-Add the private enrollment URI to a TOTP authenticator and confirm its current
-code. Subsequent login requires password plus code; reused codes are rejected.
-A host administrator can recover lost MFA with `users disable-mfa alice`, or
-restore a disabled account with `users enable alice`. These changes revoke its
-sessions. No self-service password reset or public registration is exposed.
+MFA adds a second check if someone steals a password; it does not replace the
+password. To enroll:
+
+1. Run the command above, replacing `alice` with your account name.
+2. Add the printed private `otpauth://` URI to a TOTP authenticator app. For
+   manual setup, use the value after `secret=` and before the next `&` as the
+   key, choose time-based/TOTP, and use your username as the account label.
+3. Enter the app's current six-digit code at the terminal prompt. An arbitrary
+   six-digit number will not work. Each enrollment attempt generates a new
+   secret; use the URI from the latest attempt. Invalid confirmation leaves
+   the account's MFA configuration unchanged.
+4. Sign in with **username, password, and the current authenticator code**.
+   Do not leave the password empty. Accounts without MFA leave only the code
+   field empty. Reused login codes are rejected; wait for the next code when
+   signing in again. Keep phone/computer clocks synchronized if codes fail.
+
+Keep the enrollment URI/key private; it can generate your account's codes.
+
+### Account recovery and administration
+
+Run these commands from this repository using the same `OMA_MONITOR_AUTH_DIR`
+as the running Docker monitor. Replace `alice` with the account to manage:
+
+| Task | Command |
+| --- | --- |
+| Reset a forgotten password | `bash monitor/scripts/live.sh users password alice` |
+| Disable MFA after losing the authenticator | `bash monitor/scripts/live.sh users disable-mfa alice` |
+| Enroll a replacement authenticator | `bash monitor/scripts/live.sh users mfa alice` |
+| Disable an account | `bash monitor/scripts/live.sh users disable alice` |
+| Restore a disabled account | `bash monitor/scripts/live.sh users enable alice` |
+| Inspect account roles, enabled status, and MFA status | `bash monitor/scripts/live.sh users list` |
+
+Password reset prompts for the new password twice and **does not disable MFA**.
+Password, role, enabled-status, and MFA changes revoke existing sessions; sign
+in again afterward. Recovery requires a host administrator with access to the
+private database, not a browser user. No public registration or self-service
+password reset is exposed. If login is temporarily rate-limited, wait for the
+15-minute window to expire; resetting the password does not clear that limit.
 
 Session cookies are opaque, HttpOnly, SameSite=Strict, and Secure by default.
 The local launcher allows HTTP cookies only on loopback. Logout deletes the
