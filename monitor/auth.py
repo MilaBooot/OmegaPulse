@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pyotp
 from werkzeug.security import check_password_hash, generate_password_hash
+from itsdangerous import URLSafeSerializer, BadSignature
 
 USERNAME = re.compile(r"^[\w.@+-]{1,64}$", re.UNICODE)
 ROLES = {"viewer", "operator"}
@@ -48,10 +49,18 @@ class AuthStore:
                 CREATE TABLE IF NOT EXISTS attempts (
                     ip TEXT NOT NULL, username TEXT NOT NULL,
                     time REAL NOT NULL, failed INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS attempts_time ON attempts(time);
                 CREATE INDEX IF NOT EXISTS attempts_user ON attempts(username, failed, time);
                 CREATE INDEX IF NOT EXISTS attempts_ip ON attempts(ip, time);
             ''')
+
+        with self.connection() as db:
+            # Retire pre-login database rows from the previous implementation.
+            db.execute("DELETE FROM sessions WHERE username IS NULL")
+            db.execute("INSERT OR IGNORE INTO metadata VALUES('csrf_key', ?)", (secrets.token_hex(32),))
+            key = db.execute("SELECT value FROM metadata WHERE name='csrf_key'").fetchone()[0]
+        self.prelogin_signer = URLSafeSerializer(key, salt='oma-prelogin-v1')
 
     @contextmanager
     def connection(self):
@@ -113,13 +122,23 @@ class AuthStore:
         return token, csrf
 
     def anonymous_session(self):
-        with self.connection() as db:
-            return self._new_session(db, None, self.clock())
+        # Anonymous CSRF cookies are signed and short-lived, never database rows.
+        csrf = secrets.token_urlsafe(32)
+        token = 'prelogin.' + self.prelogin_signer.dumps({'csrf': csrf, 'created': self.clock()})
+        return token, csrf
 
     def session(self, token, touch=False):
         if not token or len(token) > 256:
             return None
         now = self.clock()
+        if token.startswith('prelogin.'):
+            try:
+                data = self.prelogin_signer.loads(token[9:])
+                if 0 <= now - data['created'] < 300:
+                    return {'username': None, 'csrf': data['csrf']}
+            except (BadSignature, KeyError, TypeError):
+                pass
+            return None
         with self.connection() as db:
             row = db.execute('''SELECT s.*, u.role, u.enabled FROM sessions s
                 LEFT JOIN users u ON s.username=u.username WHERE token_hash=?''',
@@ -146,7 +165,7 @@ class AuthStore:
             db.execute("BEGIN IMMEDIATE")
             self._cleanup(db, now)
             ip_count = db.execute("SELECT count(*) FROM attempts WHERE ip=?", (ip,)).fetchone()[0]
-            failures = db.execute("SELECT count(*) FROM attempts WHERE username=? AND failed=1", (username,)).fetchone()[0]
+            failures = db.execute("SELECT count(*) FROM attempts WHERE username=? AND ip=? AND failed=1", (username, ip)).fetchone()[0]
             if ip_count >= 20 or failures >= 5:
                 raise LoginLimited()
             user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
@@ -165,7 +184,7 @@ class AuthStore:
                 return None
             if counter is not None:
                 db.execute("UPDATE users SET last_totp=? WHERE username=?", (counter, username))
-            db.execute("DELETE FROM attempts WHERE username=? AND failed=1", (username,))
+            db.execute("DELETE FROM attempts WHERE username=? AND ip=? AND failed=1", (username, ip))
             db.execute("DELETE FROM sessions WHERE token_hash=?", (self.digest(previous_token),))
             token, csrf = self._new_session(db, username, now)
             return token, csrf

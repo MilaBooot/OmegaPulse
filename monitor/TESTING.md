@@ -152,3 +152,37 @@ Authentication changed: tests now create temporary individual-account databases
 and log in using the CSRF-protected login route rather than Basic Auth headers.
 Historical validation records describe the old implementation and are not evidence
 for the new login flow. New executed results are recorded separately in HANDOFF.md.
+
+
+## Review hardening regression checks (2026-10-09)
+
+Run `python -m pytest monitor/tests -q -m 'not integration'`. The expanded suite
+covers prefixed/URL/header credentials, stateless pre-login flood resistance,
+existing database upgrades, source-scoped login limits, successful audit output,
+archive history, timestamp resume, and Falco writer-identity preflight. It also
+starts an actual Waitress HTTP server: eight streams remain open, eight additional
+requests return 429, and status, another login, and Stop remain responsive.
+This test uses a fake Docker backend and does not control real containers.
+
+For an explicitly approved native integration check, first build both images:
+
+```bash
+docker build -t oma-monitor:review-hardening monitor
+docker build -t oma-falco:review-hardening -f monitor/falco/Dockerfile monitor
+python3 monitor/tests/native_falco_check.py --allow-privileged-sensor
+```
+
+The flag authorizes a temporary privileged sensor with tracing/proc/etc and Docker
+identity mounts. Review that access before running. The `--rm` target is non-root,
+unprivileged, network-isolated, has no host mounts or Docker socket, and creates
+fake Unix sockets only in its `/run` tmpfs. The harness checks IP connect,
+unconnected UDP sendto/sendmsg, socket open/connect (including an alternate
+directory), ptrace, process environment access, namespace manipulation, and shell
+execution. Sensor and target are stopped/removed in cleanup. Private raw events
+remain under `monitor/.local/oma-review-check-*`; a JSON summary is printed.
+`sendmmsg` is included in the rule and semantic validation, but this runtime
+harness exercises sendto/sendmsg rather than sendmmsg.
+
+Recorded evidence is in `validation/review-hardening-2026-10-09.json`. GitHub
+Actions runs need independent verification in the upstream PR; local passing
+checks do not prove that upstream Actions settings or protection are enabled.

@@ -10,7 +10,7 @@ import time
 
 
 class EventWriter:
-    def __init__(self, path: Path, max_bytes=20480, interval_seconds=3600, keep=10, clock=time.time):
+    def __init__(self, path: Path, max_bytes=20480, interval_seconds=3600, keep=100, clock=time.time):
         if min(max_bytes, interval_seconds, keep) <= 0:
             raise ValueError('Rotation size, interval, and retention must be positive')
         self.path = Path(path)
@@ -54,7 +54,7 @@ def main():
     parser.add_argument('--path', type=Path, default=Path(os.environ.get('OMA_MONITOR_WRITER_FILE', '/events/oma-events.jsonl')))
     parser.add_argument('--max-bytes', type=int, default=int(os.environ.get('OMA_MONITOR_LOG_MAX_BYTES', '20480')))
     parser.add_argument('--interval-seconds', type=int, default=int(os.environ.get('OMA_MONITOR_LOG_INTERVAL_SECONDS', '3600')))
-    parser.add_argument('--keep', type=int, default=int(os.environ.get('OMA_MONITOR_LOG_KEEP', '10')))
+    parser.add_argument('--keep', type=int, default=int(os.environ.get('OMA_MONITOR_LOG_KEEP', '100')))
     args = parser.parse_args()
     # The sensor is privileged, but the file writer uses the operator's UID/GID.
     uid, gid = os.environ.get('OMA_MONITOR_WRITER_UID'), os.environ.get('OMA_MONITOR_WRITER_GID')

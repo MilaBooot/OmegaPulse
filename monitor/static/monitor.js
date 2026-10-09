@@ -124,8 +124,8 @@ async function refreshSecurityStatus() {
 async function refreshStatus() {
   try {
     const response = await fetch("/api/status", {cache: "no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     if (response.status === 401) { window.location.assign("/login"); return; }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     statusBox.className = `status ${data.state}`;
     const labels = {

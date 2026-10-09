@@ -76,7 +76,7 @@ def test_sessions_rotate_after_login_and_have_cookie_security(setup):
     response = login(client)
     assert response.status_code == 200
     assert client.get_cookie(COOKIE).value != old
-    assert store.session(old) is None
+    assert store.session(old)['username'] is None  # Pre-login tokens cannot authorize APIs.
     cookie = response.headers['Set-Cookie']
     assert 'HttpOnly' in cookie and 'SameSite=Strict' in cookie
     assert 'a-long-test-password' not in store.path.read_bytes().decode(errors='ignore')
@@ -153,7 +153,7 @@ def test_background_status_poll_does_not_extend_idle_session(setup):
     assert client.get('/api/status').status_code == 401
 
 
-def test_per_account_lockout_persists_across_clients_and_recovers(setup):
+def test_source_account_lockout_persists_and_does_not_lock_other_addresses(setup):
     app, client, _, _, now = setup
     for _ in range(5):
         assert login(client, password='wrong').status_code == 401
@@ -162,6 +162,9 @@ def test_per_account_lockout_persists_across_clients_and_recovers(setup):
                            FakeBackend(),auth_store=restarted_store)
     other = restarted.test_client()
     assert login(other).status_code == 429
+    other.environ_base['REMOTE_ADDR'] = '192.0.2.2'
+    assert login(other).status_code == 200
+    other.environ_base['REMOTE_ADDR'] = '127.0.0.1'
     now[0] += 901
     assert login(other).status_code == 200
 
@@ -243,3 +246,74 @@ def test_quiet_stream_closes_after_logout(setup):
     store.revoke(client.get_cookie(COOKIE).value)
     assert b'auth-expired' in next(response.response)
     response.close()
+
+
+def test_prelogin_flood_does_not_fill_session_table(setup):
+    app, client, _, store, now = setup
+    # The reported 10,000-cookie-free-request attack creates no persistent rows.
+    for _ in range(10001):
+        anonymous, _ = store.anonymous_session()
+        assert store.session(anonymous)['username'] is None
+    with store.connection() as db:
+        assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == 0
+    assert login(client).status_code == 200
+    now[0] += 301
+    assert store.session(anonymous) is None
+
+
+def test_tampered_prelogin_cookie_cannot_log_in(setup):
+    _, client, _, _, _ = setup
+    client.get('/login')
+    client.set_cookie(COOKIE, client.get_cookie(COOKIE).value + 'tampered')
+    assert client.post('/login', json={'csrf_token': 'anything'}).status_code == 403
+
+
+def test_audit_success_is_visible_and_contains_no_credentials(setup, capfd):
+    _, client, _, _, _ = setup
+    # Handler may have been installed before capture; verify through a fresh handler.
+    import io, logging
+    from monitor.app import logger
+    capture = io.StringIO()
+    handler = logging.StreamHandler(capture)
+    logger.addHandler(handler)
+    try:
+        login(client)
+        client.post('/api/actions/start', json={}, headers={'X-CSRF-Token': token(client)})
+    finally:
+        logger.removeHandler(handler)
+    output = capture.getvalue()
+    assert 'login user=alice result=accepted' in output
+    assert 'operator_action user=alice action=start' in output
+    assert 'a-long-test-password' not in output
+
+
+def test_stream_limit_leaves_controls_available_and_releases_slots(setup):
+    app, client, backend, store, _ = setup
+    login(client)
+    responses = [client.get('/api/logs', buffered=False) for _ in range(4)]
+    try:
+        assert all(response.status_code == 200 for response in responses)
+        assert client.get('/api/logs').status_code == 429
+        assert client.get('/api/status').status_code == 200
+        assert client.post('/api/actions/stop', json={}, headers={'X-CSRF-Token': token(client)}).status_code == 200
+    finally:
+        for response in responses:
+            response.close()
+    response = client.get('/api/logs', buffered=False)
+    assert response.status_code == 200
+    response.close()
+
+
+def test_upgrade_retires_legacy_anonymous_rows_and_preserves_signed_cookies(setup):
+    _, client, _, store, now = setup
+    prelogin, _ = store.anonymous_session()
+    assert login(client).status_code == 200
+    authenticated = client.get_cookie(COOKIE).value
+    with store.connection() as db:
+        db.execute('INSERT INTO sessions VALUES(?,NULL,?,?,?)',
+                   ('legacy-anonymous', 'old-csrf', now[0], now[0]))
+    upgraded = AuthStore(store.path, clock=lambda: now[0])
+    assert upgraded.session(prelogin)['username'] is None
+    assert upgraded.session(authenticated)['username'] == 'alice'
+    with upgraded.connection() as db:
+        assert db.execute('SELECT count(*) FROM sessions WHERE username IS NULL').fetchone()[0] == 0

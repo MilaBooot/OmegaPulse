@@ -207,3 +207,18 @@ def test_stopped_container_delivers_history_then_one_waiting_notice():
         assert str(exc) == "test complete"
     assert container.log_calls[0]["follow"] is False
     assert container.log_calls[0]["tail"] == 200
+
+
+def test_restart_same_container_resumes_timestamped_logs_without_duplicates():
+    first_line = b'2026-10-09T12:00:00.123456789Z first\n'
+    startup = b'2026-10-09T12:00:01.123456789Z startup\n'
+    first = FakeLogContainer([first_line], 'same-id')
+    second = FakeLogContainer([first_line, startup], 'same-id')
+    clients = iter([FakeClient(first), FakeClient(second)])
+    events = DockerBackend('omega', client_factory=lambda: next(clients), sleeper=lambda _: None).log_events()
+    assert next(events)['text'].endswith('first')
+    assert 'reconnecting' in next(events)['text']
+    assert next(events)['text'].endswith('startup')
+    assert second.log_calls[0]['tail'] == 'all'
+    assert second.log_calls[0]['since'].isoformat() == '2026-10-09T12:00:00+00:00'
+    events.close()

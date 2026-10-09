@@ -67,7 +67,7 @@ class SecurityEventReader:
                         lines = chain(self._rotated_records(identity, position),
                                       self._complete_records(self.path, progress=progress))
                     else:
-                        lines, position = self._tail_lines(self.path, count=100)
+                        lines, position = self._recent_lines(count=100)
                     identity = current_identity
                     if rotated or truncated:
                         yield self._system("Security event file rotated; following the replacement.")
@@ -126,6 +126,25 @@ class SecurityEventReader:
             }
         except (AttributeError, json.JSONDecodeError):
             return None
+
+    def _recent_lines(self, count):
+        # One bounded window across the active file and newest retained archives.
+        budget = 1_048_576
+        size = self.path.stat().st_size
+        lines, position = self._tail_lines(self.path, count=count, byte_limit=budget)
+        budget -= min(size, budget)
+        archives = sorted(self.path.parent.glob(f"{self.path.stem}.*.jsonl"), reverse=True)
+        for archive in archives:
+            if len(lines) >= count or budget <= 0:
+                break
+            try:
+                size = archive.stat().st_size
+                older, _ = self._tail_lines(archive, count=count-len(lines), byte_limit=budget)
+            except FileNotFoundError:
+                continue  # Retention can remove an archive during this snapshot.
+            budget -= min(size, budget)
+            lines = older + lines
+        return lines, position
 
     def _rotated_records(self, identity, position):
         found = False

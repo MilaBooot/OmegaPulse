@@ -1,8 +1,9 @@
 # Falco runtime sensor
 
 Falco observes the native Linux kernel and reports outbound connections,
-namespace/mount operations, shell/network tooling, and Docker-socket pathname
-access. Signals describe attempts, not confirmed compromise. Expected provider
+namespace/mount operations, shell/network tooling, Docker-socket open/connect
+access, process tracing, and process environment access. Datagram sends without
+a preceding connect are included. Signals describe attempts, not confirmed compromise. Expected provider
 traffic needs profiling and reviewed allowlists before production alerting.
 
 ## Configured target
@@ -23,6 +24,14 @@ The Docker launcher renders automatically and mounts only the rendered rules:
 bash monitor/scripts/falco.sh
 ```
 
+The launcher validates the writer identity before starting the sensor. Run it
+as the same non-root user as the monitor. If an administrator launches it as
+root, explicitly set `OMA_MONITOR_WRITER_UID` and `OMA_MONITOR_WRITER_GID` to
+that non-root account's numeric IDs, and prepare `OMA_MONITOR_EVENTS_DIR` owned
+by those IDs first. UID/GID 0 and mismatched directory ownership fail before
+Docker starts; the writer remains non-root. The launcher does not change host
+ownership automatically.
+
 Existing containers retain their launch configuration; changing the environment
 requires creating a new sensor with a different `OMA_FALCO_CONTAINER`, after
 stopping the previous sensor. Do not run duplicate sensors unnecessarily.
@@ -40,7 +49,7 @@ rotation. The active filename stays stable for the monitor's read-only reader.
 | --- | --- |
 | `OMA_MONITOR_LOG_MAX_BYTES` | `20480` (20 KiB) |
 | `OMA_MONITOR_LOG_INTERVAL_SECONDS` | `3600` (one hour) |
-| `OMA_MONITOR_LOG_KEEP` | `10` archives, plus the active file |
+| `OMA_MONITOR_LOG_KEEP` | `100` archives, plus the active file |
 
 Example:
 
@@ -81,3 +90,7 @@ mounts. The monitor does not expose Falco's control surface. Validate capture,
 false-positive volume, and dropped-event metrics on the native deployment host.
 
 Reference: [Falco output channels](https://falco.org/docs/concepts/outputs/channels/).
+
+The pathname rule also matches alternate directories with a `docker.sock`
+basename. Arbitrarily renamed sockets and renamed shell binaries need additional
+reviewed rules; the supplied rules are indicators, not comprehensive detection.

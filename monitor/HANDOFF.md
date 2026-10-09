@@ -53,10 +53,10 @@ No production deployment or release was performed.
 ## Original prototype implementation decisions
 
 - Flask + Waitress and Docker SDK dependencies live only under `monitor/`.
-- HTTP Basic auth avoids secrets in URLs, application-managed browser storage,
-  and logs. It is appropriate only on localhost, through SSH, or behind HTTPS.
-  Missing credentials fail closed and passwords shorter than 12 characters are
-  rejected; no development/default login exists.
+- The original Basic Auth prototype has been replaced by individual accounts,
+  server-side sessions, roles, and optional MFA. Use localhost, SSH, or HTTPS;
+  configuration fails closed and passwords must have at least 12 characters.
+  No development/default login exists.
 - Container name is startup configuration; status/log APIs reject all query
   parameters and expose no generic Docker operation.
 - Server-sent events provide timestamped log streaming. The backend reattaches
@@ -69,7 +69,7 @@ No production deployment or release was performed.
 - No shared server log buffer exists. Partial records are bounded, and the
   browser retains at most 1,000 records.
 - Lifecycle routes expose only Start, Stop, and Restart for the startup-configured
-  target. They require Basic auth, POST JSON, a random CSRF token in a custom
+  target. They require an operator session, POST JSON, a per-session CSRF token in a custom
   header, same-origin browser metadata, explicit UI confirmation, and a lock
   that prevents concurrent actions. Results are audit logged without secrets.
 - Start calls Docker's start operation on an existing container. It does not
@@ -439,3 +439,49 @@ the alert-all outbound rule into a reviewed allowlist, validate false-positive
 volume and dropped-event metrics, and choose durable audit/security-event
 retention. Automatic stop or network isolation on an alert must not be enabled
 until false-positive and recovery procedures are approved.
+
+
+### Second review hardening — 2026-10-09
+
+Addressed the findings against `c06fc89` in the isolated OmegaPulse checkout.
+
+| Finding | Resolution |
+| --- | --- |
+| Eight SSE requests block all server workers | Admit eight streams total/four per account; use 16 workers so login/status/controls retain capacity. Excess requests fail with 429. |
+| Secret formats escape redaction | Cover environment prefixes, Telegram URL tokens, provider key formats, and quoted/unquoted authorization headers; regression tests added. |
+| Root Falco launcher silently loses writer output | Reject UID/GID 0 before launch; support explicit non-root writer IDs and validate directory ownership. |
+| Successful audit messages suppressed | Configure timestamped INFO audit output explicitly on stderr. |
+| Anonymous login requests fill persistent sessions | Signed five-minute pre-login cookies create no database rows; retire legacy anonymous rows while preserving authenticated sessions/accounts. |
+| Username lockout can deny another client's access | Scope five-failure limit to username plus source IP; retain 20-attempt source-IP cap and restart persistence. Shared addresses still share limits. |
+| Falco coverage gaps | Add UDP sends, Unix socket connect and alternate `docker.sock` directories, ptrace, and `/proc/*/environ` opens. Renamed executables/arbitrary socket filenames remain explicit limitations. |
+| Short retention and missing initial archive history | Default 100 archives; load bounded recent history across archives and active file. |
+| Restart loses first new log records | Resume by Docker timestamp and deduplicate records at the inclusive boundary. |
+| Stale Basic Auth description | Update the prototype description to identify the replacement session authentication. |
+| CI never ran upstream | Add Python 3.12/3.14 jobs and a stable aggregate required check; document Actions/fork approval troubleshooting. Maintainer settings and upstream execution remain externally pending. |
+
+Validation: **93 unit tests passed on each Python version** (3.12: 12.56 s;
+3.14: 13.35 s), three integration tests excluded from each unit run. The real
+HTTP server regression passed with eight admitted/eight rejected streams while
+status, login, and Stop remained responsive. Three real Docker acceptance tests passed (41.45 s) against a disposable
+non-root target. Both Docker images built, and the rendered final rules passed Falco 0.45.0 semantic validation.
+
+Native modern-eBPF capture passed for all six rule families. Explicit syscall
+fields confirmed `connect`, UDP `sendto`/`sendmsg`, and Docker-socket
+`connect`/`openat`, including `/run/alternate/docker.sock`. Fake sockets existed
+only inside the target's tmpfs. The target was non-root/unprivileged with no host
+mounts; only the previously approved sensor had privileged host observation.
+Temporary native containers were removed. Runtime `sendmmsg` and arbitrary
+renamed shell/socket detection are not claimed. Kernel observed: 7.0.0-14-generic.
+
+Evidence: `monitor/validation/review-hardening-2026-10-09.json`. Raw synthetic
+native events are Git-ignored under `monitor/.local/oma-review-check-*`.
+Test harness issues (cached dependency path, tmpfs execution policy, socket group
+mapping, shortened Falco IDs) were corrected before successful runs; they are
+recorded in the evidence. No production Oma container was controlled, and no
+changes have been pushed or deployed.
+
+The final real-Docker startup recovery check also passed: an existing log stream
+received the first marker from the new run, compared against Docker's actual
+`State.StartedAt` so older retained startup lines could not satisfy the check.
+All temporary lifecycle and native containers were removed. Native rotated
+files were private and within the configured 20 KiB limit.

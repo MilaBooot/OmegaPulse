@@ -4,15 +4,15 @@
   condition: container.name = __OMA_MONITOR_CONTAINER__
 
 - macro: oma_network_connection
-  condition: syscall.type = connect and (fd.typechar = 4 or fd.typechar = 6)
+  condition: (syscall.type = connect or (syscall.type in (sendto, sendmsg, sendmmsg) and fd.l4proto = udp)) and (fd.typechar = 4 or fd.typechar = 6)
 
 - rule: Oma outbound connection attempt
-  desc: Report every IPv4/IPv6 connect attempt made by a process in Oma.
+  desc: Report IPv4/IPv6 connect and datagram send attempts made by Oma.
   condition: oma_target_container and oma_network_connection
   output: >
     Oma outbound connection attempt
     (container_name=%container.name container_id=%container.id
-    process=%proc.name command=%proc.cmdline connection=%fd.name
+    syscall=%syscall.type process=%proc.name command=%proc.cmdline connection=%fd.name
     user=%user.name)
   priority: NOTICE
   tags: [container, network, oma, mitre_command_and_control]
@@ -45,15 +45,37 @@
   tags: [container, shell, network, oma, mitre_execution]
 
 - rule: Oma attempts Docker socket access
-  desc: Report attempts by Oma to open a Docker daemon socket.
+  desc: Report open/connect attempts to paths named docker.sock, including alternate mount directories.
   condition: >
     oma_target_container and
-    evt.type in (open, openat, openat2) and
-    (fd.name = /var/run/docker.sock or fd.name = /run/docker.sock)
+    evt.type in (open, openat, openat2, connect) and
+    (fd.name endswith /docker.sock or fd.name = docker.sock)
   output: >
     Oma attempted Docker socket access
     (container_name=%container.name container_id=%container.id
-    file=%fd.name process=%proc.name command=%proc.cmdline user=%user.name)
+    syscall=%syscall.type file=%fd.name process=%proc.name command=%proc.cmdline user=%user.name)
   priority: CRITICAL
   tags: [container, filesystem, oma, mitre_privilege_escalation]
 
+
+- rule: Oma process tracing attempt
+  desc: Report ptrace attempts, which can inspect or alter another process.
+  condition: oma_target_container and syscall.type = ptrace
+  output: >
+    Oma process tracing attempt
+    (container_name=%container.name container_id=%container.id
+    process=%proc.name command=%proc.cmdline user=%user.name)
+  priority: WARNING
+  tags: [container, process, oma]
+
+- rule: Oma process environment access
+  desc: Report attempts to open proc process environment files, which can contain secrets.
+  condition: >
+    oma_target_container and evt.type in (open, openat, openat2) and
+    fd.name startswith /proc/ and fd.name endswith /environ
+  output: >
+    Oma process environment access
+    (container_name=%container.name container_id=%container.id
+    syscall=%syscall.type file=%fd.name process=%proc.name command=%proc.cmdline user=%user.name)
+  priority: WARNING
+  tags: [container, filesystem, oma]

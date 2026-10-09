@@ -30,10 +30,12 @@ monitor configuration:
 
 | Rule | Watched operation | Priority |
 | --- | --- | --- |
-| Outbound connection | IPv4/IPv6 `connect` syscall attempts | Notice |
+| Outbound connection | IPv4/IPv6 `connect`, `sendto`, `sendmsg`, `sendmmsg` attempts | Notice |
 | Namespace/mount manipulation | `setns`, `unshare`, `mount`, `umount`, `umount2` | Warning |
 | Shell/network utility | `execve`/`execveat` for the listed shells and network tools | Warning |
-| Docker-socket access | `open`/`openat`/`openat2` of the two configured socket paths | Critical |
+| Docker-socket access | Open/connect attempts to paths with a `docker.sock` basename | Critical |
+| Process tracing | `ptrace` attempts | Warning |
+| Process environment access | Opening `/proc/*/environ` | Warning |
 
 [scripts/falco.sh](scripts/falco.sh) is the complete sensor launch command. It
 selects `engine.kind=modern_ebpf` and uses `--privileged`, which grants broad
@@ -77,8 +79,14 @@ Generate three controlled security indicators with:
 bash monitor/scripts/live.sh signals
 ```
 
-Find the printed marker in the security panel. To inspect sensor startup or stop
-only the sensor:
+Find the printed marker in the security panel. The `signals` helper generates
+attempts; Falco must already be running to capture them. The disposable native
+test stops/removes its own sensor and does not leave a sensor running for the
+browser. Both live launchers must use the same `OMA_MONITOR_CONTAINER` and
+`OMA_MONITOR_EVENTS_DIR`. Connection refusal and `unshare` errno 1 are expected;
+missing browser alerts mean the capture/file/stream path needs checking.
+
+To inspect sensor startup or stop only the sensor:
 
 ```bash
 docker logs --tail 50 oma-falco-live
@@ -189,16 +197,25 @@ private database, not a browser user. No public registration or self-service
 password reset is exposed. If login is temporarily rate-limited, wait for the
 15-minute window to expire; resetting the password does not clear that limit.
 
-Session cookies are opaque, HttpOnly, SameSite=Strict, and Secure by default.
+Authenticated session cookies are opaque, HttpOnly, SameSite=Strict, and Secure by default.
 The local launcher allows HTTP cookies only on loopback. Logout deletes the
 server-side session, and account/password/role/MFA changes revoke all that user's
 sessions. Sessions expire after 15 minutes without page navigation/control
 requests or after eight hours absolutely. Background polling and SSE do not
-extend idle lifetime. Event streams also check revocation while quiet.
+extend idle lifetime. Event streams also check revocation while quiet. The server admits at most eight
+streams total and four per account (two dashboards), reserving eight of its 16
+workers for login, status, and controls. Additional streams get HTTP 429; close
+extra dashboards to reconnect. This bounds streaming load, not arbitrary HTTP floods.
 
-Login is limited to five failed attempts per username and 20 total attempts per
+Login is limited to five failed attempts per username/source-IP pair and 20 total attempts per
 source IP in a rolling 15-minute window; blocked requests return HTTP 429.
 Limits persist across restarts and cannot be bypassed by `X-Forwarded-For`.
+Failures from another source address do not lock the account globally. Clients
+sharing one address (including a reverse proxy or local users) share its limit.
+Pre-login CSRF cookies are signed, expire after five minutes, and create no
+database sessions; repeated login-page requests cannot fill the session table.
+Refresh the login page if it has been open for more than five minutes before
+submitting credentials.
 Behind a reverse proxy, the observed source is the proxy; configure trusted
 proxy handling at the deployment boundary if per-client limits are needed.
 
@@ -325,3 +342,36 @@ credentials do not grant access. Preserve the existing event directory using
 `OMA_MONITOR_EVENTS_DIR` if needed. Existing old sensor containers still use
 unrotated native file output; adopting the writer requires a newly built sensor.
 Review kernel privileges before switching, and avoid running duplicate sensors.
+
+
+### Reviewing operational gaps
+
+Successful logins and lifecycle actions are emitted at INFO to the monitor's
+stderr with timestamps and usernames; inspect them with `docker logs` on the
+monitor container. Passwords, MFA codes, and session tokens are never audited.
+Container output is redacted before display, including prefixed environment
+secrets, authorization headers, provider keys, and Telegram URL tokens. This is
+best-effort filtering; raw Docker/Falco files still require private storage.
+
+A new security stream loads up to 100 recent records across the active file and
+retained archives, bounded to 1 MiB of input. Default retention is 100 archives
+of 20 KiB plus the active file (about 2 MiB); configure `OMA_MONITOR_LOG_KEEP`
+for your traffic volume. This is a size bound, not a guaranteed time window.
+Log streams resume using Docker timestamps after restart; records at the resume
+boundary are deduplicated. Extremely busy boundaries exceeding 2,000 distinct
+lines may replay duplicates, and deleted Docker history cannot be recovered.
+
+Falco covers IP connect/datagram-send attempts, namespace operations, selected
+shell/tool names, Docker-socket open/connect paths ending in `docker.sock`,
+ptrace, and opening `/proc/*/environ`. It cannot identify every renamed executable
+or a Docker socket mounted under an arbitrary filename. Tune additional rules
+against the application before treating these signals as confirmed compromise.
+
+
+If no CI checks appear on a fork PR, the upstream maintainer should check
+**Actions** is enabled and look for **Approve workflows to run** on the PR.
+The workflow uses `pull_request` and read-only permissions. Both Python 3.12
+and 3.14 must pass before the aggregate `monitor-unit-tests` check passes.
+`workflow_dispatch` also permits manual runs once the workflow is available on
+the repository's default branch. Enabling Actions, approving a fork run, and
+requiring the check are repository settings; code alone cannot perform them.

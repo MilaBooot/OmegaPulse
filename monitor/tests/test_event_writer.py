@@ -67,3 +67,14 @@ def test_reader_drains_unread_archives_when_multiple_rotations_happen_between_po
     assert 'rotated' in next(events)['text']
     assert [next(events)['text'] for _ in range(6)]==[str(i) for i in range(1,7)]
     events.close(); writer.close()
+
+
+def test_new_reader_replays_recent_history_across_archives(tmp_path):
+    path = tmp_path/'oma-events.jsonl'
+    writer = EventWriter(path, max_bytes=len(record(0))*2)
+    for number in range(8):
+        writer.write(record(number))
+    writer.close()
+    events = SecurityEventReader(path, 'omega').events()
+    assert [next(events)['text'] for _ in range(8)] == [str(i) for i in range(8)]
+    events.close()

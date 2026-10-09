@@ -128,6 +128,30 @@ class DockerBackend:
         """Follow logs forever, reconnecting after failures or container replacement."""
         last_container_id: str | None = None
         last_notice: str | None = None
+        cursor = None
+        boundary_counts = {}
+
+        def unseen(line, replay_counts):
+            nonlocal cursor, boundary_counts
+            stamp, separator, _ = line.partition(' ')
+            if not separator or not stamp.endswith('Z'):
+                return True
+            try:
+                second = datetime.fromisoformat(stamp.replace('Z', '+00:00')).replace(microsecond=0)
+            except ValueError:
+                return True
+            # Docker's since is inclusive; preserve counts of identical lines.
+            if replay_counts.get(line, 0):
+                replay_counts[line] -= 1
+                return False
+            if cursor is None or second > cursor:
+                cursor, boundary_counts = second, {}
+            if second == cursor:
+                boundary_counts[line] = boundary_counts.get(line, 0) + 1
+                if len(boundary_counts) > 2000:
+                    boundary_counts.pop(next(iter(boundary_counts)))
+            return True
+
         while stop_event is None or not stop_event.is_set():
             client = None
             try:
@@ -136,7 +160,11 @@ class DockerBackend:
                 container = client.containers.get(self.container_name)
                 container_id = container.id
                 is_new_container = container_id != last_container_id
-                tail = 200 if is_new_container else 0
+                if is_new_container:
+                    cursor = None
+                    boundary_counts = {}
+                tail = 200 if cursor is None else 'all'
+                resume = {'since': cursor} if cursor else {}
                 if last_container_id is not None and is_new_container:
                     yield self._system_event("Container recreation detected; attached to the replacement.")
                 last_container_id = container_id
@@ -157,6 +185,7 @@ class DockerBackend:
                             tail=tail,
                         )
                         for line in _bounded_lines(historical_chunks):
+                            unseen(line, {})
                             last_notice = None
                             yield {"type": "log", "text": redact(line)}
                     notice = "Target container is stopped; waiting for it to start."
@@ -172,7 +201,9 @@ class DockerBackend:
                     follow=True,
                     timestamps=True,
                     tail=tail,
+                    **resume,
                 )
+                replay_counts = dict(boundary_counts)
                 finished = threading.Event()
                 if stop_event is not None:
                     def cancel_when_stopped(watched=chunks, done=finished):
@@ -186,6 +217,8 @@ class DockerBackend:
                     for line in _bounded_lines(chunks):
                         if stop_event is not None and stop_event.is_set():
                             return
+                        if not unseen(line, replay_counts):
+                            continue
                         last_notice = None
                         yield {"type": "log", "text": redact(line)}
                 finally:

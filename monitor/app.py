@@ -8,7 +8,7 @@ import threading
 from functools import wraps
 from typing import Any, Callable
 
-from flask import Flask, Response, g, jsonify, redirect, render_template, request, stream_with_context
+from flask import Flask, Response, g, jsonify, redirect, render_template, request
 
 from .auth import AuthStore, COOKIE, LoginLimited
 from .config import MonitorConfig
@@ -16,7 +16,20 @@ from .docker_backend import DockerActionError, DockerBackend
 from .security_backend import SecurityEventReader
 
 
+SERVER_THREADS = 16
+MAX_STREAMS = 8
+MAX_USER_STREAMS = 4
 logger = logging.getLogger("oma_monitor.audit")
+
+
+def configure_audit_logging():
+    # Configure only our audit logger, keeping host applications' logging intact.
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def create_app(
@@ -25,6 +38,7 @@ def create_app(
     security_backend: SecurityEventReader | None = None,
     auth_store: AuthStore | None = None,
 ) -> Flask:
+    configure_audit_logging()
     settings = config or MonitorConfig.from_env()
     docker_backend = backend or DockerBackend(
         settings.container_name, settings.reconnect_seconds
@@ -58,6 +72,41 @@ def create_app(
             return function(*args, **kwargs)
 
         return wrapped
+
+    stream_lock = threading.Lock()
+    streams = {}
+
+    def stream_response(iterator):
+        username = g.identity['username']
+        with stream_lock:
+            if sum(streams.values()) >= MAX_STREAMS or streams.get(username, 0) >= MAX_USER_STREAMS:
+                response = jsonify({'error': 'stream-limit', 'message': 'Close another dashboard and retry.'})
+                response.status_code = 429
+                response.headers['Retry-After'] = '5'
+                return response
+            streams[username] = streams.get(username, 0) + 1
+        released = False
+
+        def release():
+            nonlocal released
+            with stream_lock:
+                if not released:
+                    streams[username] -= 1
+                    if not streams[username]:
+                        del streams[username]
+                    released = True
+
+        def admitted():
+            try:
+                yield from iterator
+            finally:
+                iterator.close()
+                release()
+
+        response = Response(admitted(), content_type='text/event-stream; charset=utf-8',
+                            headers={'X-Accel-Buffering': 'no'})
+        response.call_on_close(release)
+        return response
 
     @app.after_request
     def security_headers(response: Response) -> Response:
@@ -130,9 +179,8 @@ def create_app(
         response.delete_cookie(COOKIE, secure=settings.cookie_secure, httponly=True, samesite="Strict")
         return response
 
-    def authorized_events(factory):
+    def authorized_events(factory, token):
         # Poll revocation even while Docker or the security file is quiet.
-        token = request.cookies.get(COOKIE, "")
         stopped = threading.Event()
         pending = queue.Queue(maxsize=32)
         finished = object()
@@ -206,21 +254,18 @@ def create_app(
         if request.args:
             return jsonify({"error": "query parameters are not accepted"}), 400
 
-        @stream_with_context
+        token = request.cookies.get(COOKIE, "")
+
         def stream() -> Any:
             yield "retry: 3000\n\n"
-            for event in authorized_events(lambda stop: docker_backend.log_events(stop_event=stop)):
+            for event in authorized_events(lambda stop: docker_backend.log_events(stop_event=stop), token):
                 if event.get("type") == "heartbeat":
                     yield ": keepalive\n\n"
                     continue
                 event_type = event.get("type") if event.get("type") in {"log", "auth-expired"} else "system"
                 yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        return Response(
-            stream(),
-            content_type="text/event-stream; charset=utf-8",
-            headers={"X-Accel-Buffering": "no"},
-        )
+        return stream_response(stream())
 
     @app.post("/api/actions/<action>")
     @authenticated
@@ -271,21 +316,18 @@ def create_app(
         if request.args:
             return jsonify({"error": "query parameters are not accepted"}), 400
 
-        @stream_with_context
+        token = request.cookies.get(COOKIE, "")
+
         def stream() -> Any:
             yield "retry: 3000\n\n"
-            for event in authorized_events(lambda stop: event_reader.events(stop_event=stop)):
+            for event in authorized_events(lambda stop: event_reader.events(stop_event=stop), token):
                 if event.get("type") == "heartbeat":
                     yield ": keepalive\n\n"
                     continue
                 event_type = event.get("type") if event.get("type") in {"security", "auth-expired"} else "system"
                 yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-        return Response(
-            stream(),
-            content_type="text/event-stream; charset=utf-8",
-            headers={"X-Accel-Buffering": "no"},
-        )
+        return stream_response(stream())
 
     return app
 
@@ -295,7 +337,7 @@ def main() -> None:
 
     settings = MonitorConfig.from_env()
     app = create_app(settings)
-    serve(app, host=settings.host, port=settings.port, threads=8)
+    serve(app, host=settings.host, port=settings.port, threads=SERVER_THREADS)
 
 
 if __name__ == "__main__":
